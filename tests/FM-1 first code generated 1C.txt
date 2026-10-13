@@ -1,0 +1,207 @@
+#pragma once
+#include <cmath>
+#include <cstdint>
+#include <vector>
+
+#define SAMPLE_RATE 44100
+#define TWO_PI 6.28318530717958647692f
+#define MAX_VOICES 6 // Balanced for the FM-1's Jieli hardware constraints
+
+struct SynthParameters {
+    float cutoff = 0.4f;
+    float resonance = 0.1f;
+    float modulationAmount = 0.2f;
+    float attack = 0.01f;
+    float release = 0.6f;
+    float delayTime = 0.3f;   // 0.0 to 1.0 (maps to delay buffer size)
+    float delayFeedback = 0.4f; // 0.0 to 0.95
+    float delayWetMix = 0.3f;   // 0.0 to 1.0
+};
+
+// ==========================================
+// INDIVIDUAL VOICE DEFINITION
+// ==========================================
+class SynthVoice {
+public:
+    float phaseCarrier = 0.0f;
+    float phaseModulator = 0.0f;
+    float carrierFreq = 0.0f;
+    float modulatorFreq = 0.0f;
+    float envelopeValue = 0.0f;
+    bool gateActive = false;
+    uint8_t currentNote = 0; // Tracks which MIDI note this voice is playing
+    uint32_t age = 0;        // For voice stealing tracking
+
+    void triggerNote(uint8_t note, float freq) {
+        currentNote = note;
+        carrierFreq = freq;
+        modulatorFreq = freq * 2.0f; // 2:1 Ratio
+        gateActive = true;
+        envelopeValue = 1.0f;        // Instant attack for clarity
+        age = 0;
+    }
+
+    void releaseNote() {
+        gateActive = false;
+    }
+
+    bool isActive() const {
+        return (gateActive || envelopeValue > 0.001f);
+    }
+
+    float processSample(const SynthParameters& params) {
+        if (!isActive()) return 0.0f;
+
+        age++;
+
+        // 1. Modulator oscillator
+        phaseModulator += modulatorFreq / SAMPLE_RATE;
+        if (phaseModulator >= 1.0f) phaseModulator -= 1.0f;
+        float modSignal = std::sin(phaseModulator * TWO_PI) * params.modulationAmount;
+
+        // 2. Carrier oscillator modulated by modSignal
+        phaseCarrier += (carrierFreq / SAMPLE_RATE) + (modSignal * 0.01f);
+        if (phaseCarrier >= 1.0f) phaseCarrier -= 1.0f;
+        float rawSample = std::sin(phaseCarrier * TWO_PI);
+
+        // 3. Amplitude Envelope Processing
+        if (!gateActive) {
+            envelopeValue -= (1.0f / (params.release * SAMPLE_RATE));
+            if (envelopeValue < 0.0f) envelopeValue = 0.0f;
+        }
+
+        return rawSample * envelopeValue;
+    }
+};
+
+// ==========================================
+// STEREO PING-PONG DELAY EFFECT
+// ==========================================
+class PingPongDelay {
+private:
+    static const uint32_t MAX_DELAY_LENGTH = SAMPLE_RATE; // 1 second maximum delay buffer
+    float bufferLeft[MAX_DELAY_LENGTH] = {0.0f};
+    float bufferRight[MAX_DELAY_LENGTH] = {0.0f};
+    uint32_t writePtr = 0;
+
+public:
+    void processStereo(float& sampleL, float& sampleR, const SynthParameters& params) {
+        // Map parameter float to actual sample delay time (minimum 20ms to prevent comb filtering)
+        uint32_t delaySamples = static_cast<uint32_t>(params.delayTime * (MAX_DELAY_LENGTH - 1000)) + 1000;
+        
+        // Calculate read positions for ping-pong alternating configuration
+        int32_t readPtrL = static_cast<int32_t>(writePtr) - delaySamples;
+        if (readPtrL < 0) readPtrL += MAX_DELAY_LENGTH;
+
+        // Read decaying feedback from buffers
+        float delayOutL = bufferLeft[readPtrL];
+        float delayOutR = bufferRight[writePtr]; // Cross-fed right buffer input
+
+        // Cross feedback ping-pong logic
+        bufferLeft[writePtr]  = sampleL + (delayOutR * params.delayFeedback);
+        bufferRight[writePtr] = sampleR + (delayOutL * params.delayFeedback);
+
+        // Advance write head pointer ring buffer loop
+        writePtr = (writePtr + 1) % MAX_DELAY_LENGTH;
+
+        // Mix dry input and processed wet signals
+        sampleL = (sampleL * (1.0f - params.delayWetMix)) + (delayOutL * params.delayWetMix);
+        sampleR = (sampleR * (1.0f - params.delayWetMix)) + (delayOutR * params.delayWetMix);
+    }
+};
+
+// ==========================================
+// CORE AUDIO AUDIO ENGINE MODULE
+// ==========================================
+class PolyCustomEngine {
+private:
+    SynthVoice voices[MAX_VOICES];
+    SynthParameters params;
+    PingPongDelay delayEffect;
+    float lowpassLeft = 0.0f;
+    float lowpassRight = 0.0f;
+
+public:
+    PolyCustomEngine() {}
+
+    void noteOn(uint8_t note, uint8_t velocity) {
+        float frequency = 440.0f * std::pow(2.0f, (note - 69) / 12.0f);
+        
+        // 1. Try to find an existing voice already handling this exact note
+        for (int i = 0; i < MAX_VOICES; ++i) {
+            if (voices[i].isActive() && voices[i].currentNote == note) {
+                voices[i].triggerNote(note, frequency);
+                return;
+            }
+        }
+
+        // 2. Look for an available completely idle voice
+        for (int i = 0; i < MAX_VOICES; ++i) {
+            if (!voices[i].isActive()) {
+                voices[i].triggerNote(note, frequency);
+                return;
+            }
+        }
+
+        // 3. Voice Stealing: If polyphony is exhausted, steal the oldest active voice
+        int oldestVoiceIdx = 0;
+        uint32_t maxAge = 0;
+        for (int i = 0; i < MAX_VOICES; ++i) {
+            if (voices[i].age > maxAge) {
+                maxAge = voices[i].age;
+                oldestVoiceIdx = i;
+            }
+        }
+        voices[oldestVoiceIdx].triggerNote(note, frequency);
+    }
+
+    void noteOff(uint8_t note) {
+        // Release all voices currently assigned to this specific note number
+        for (int i = 0; i < MAX_VOICES; ++i) {
+            if (voices[i].currentNote == note) {
+                voices[i].releaseNote();
+            }
+        }
+    }
+
+    void updateParameter(uint8_t paramId, float value) {
+        switch(paramId) {
+            case 10: params.cutoff = value; break;
+            case 11: params.resonance = value; break;
+            case 12: params.modulationAmount = value * 2.0f; break; // Scale parameter headroom
+            case 13: params.attack = (value * 2.0f) + 0.001f; break;
+            case 14: params.release = (value * 4.0f) + 0.01f; break;
+            case 15: params.delayTime = value; break;
+            case 16: params.delayFeedback = value * 0.92f; break; // Clamp below runaway unit feedback feedback loops
+            case 17: params.delayWetMix = value; break;
+        }
+    }
+
+    void processAudioBuffer(float* outputBuffer, uint32_t numSamples) {
+        for (uint32_t i = 0; i < numSamples; ++i) {
+            float mixedSample = 0.0f;
+
+            // Sum up contributions from all concurrently running active voices
+            for (int v = 0; v < MAX_VOICES; ++v) {
+                mixedSample += voices[v].processSample(params);
+            }
+
+            // Normalization scaler adjustment preventing clipping distortion across voice summation
+            mixedSample *= (1.0f / static_cast<float>(MAX_VOICES)) * 1.5f;
+
+            // Apply global filtering
+            lowpassLeft  += (params.cutoff * 0.15f) * (mixedSample - lowpassLeft);
+            lowpassRight += (params.cutoff * 0.15f) * (mixedSample - lowpassRight);
+
+            float outL = lowpassLeft;
+            float outR = lowpassRight;
+
+            // Pass signals into dynamic stereo delay routing processor
+            delayEffect.processStereo(outL, outR, params);
+
+            // Write interleaved stereo stream frames into out audio processing pipeline target buffer array
+            outputBuffer[i * 2]     = outL;
+            outputBuffer[i * 2 + 1] = outR;
+        }
+    }
+};

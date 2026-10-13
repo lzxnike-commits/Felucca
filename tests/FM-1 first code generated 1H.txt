@@ -1,0 +1,40 @@
+{
+  "engine_name": "Maximized Lo-Fi Ambient Engine",
+  "polyphony_voices": 4,
+  "parameter_groups": [
+    {
+      "group_name": "Synth Core",
+      "controls": [
+        {"name": "Cutoff", "cc": 10, "min": 0, "max": 127, "default": 64},
+        {"name": "Resonance", "cc": 11, "min": 0, "max": 127, "default": 20},
+        {"name": "FM Mod Amount", "cc": 12, "min": 0, "max": 127, "default": 40},
+        {"name": "Attack", "cc": 13, "min": 0, "max": 127, "default": 5},
+        {"name": "Release", "cc": 14, "min": 0, "max": 127, "default": 80}
+      ]
+    },
+    {
+      "group_name": "Texture",
+      "controls": [
+        {"name": "Analog Haze", "cc": 30, "min": 0, "max": 127, "default": 0, "description": "Asymmetric distortion and warm low-mid shroud"},
+        {"name": "Dust Grain", "cc": 31, "min": 0, "max": 127, "default": 0, "description": "Vinyl/Tape crackle static sparks"}
+      ]
+    },
+    {
+      "group_name": "Extreme Delay",
+      "controls": [
+        {"name": "Delay Time", "cc": 20, "min": 0, "max": 127, "default": 64},
+        {"name": "Feedback (Infinite)", "cc": 21, "min": 0, "max": 127, "default": 50},
+        {"name": "HF Damp", "cc": 22, "min": 0, "max": 127, "default": 30},
+        {"name": "Delay Mix", "cc": 23, "min": 0, "max": 127, "default": 0}
+      ]
+    },
+    {
+      "group_name": "Space Reverb",
+      "controls": [
+        {"name": "Space Size", "cc": 24, "min": 0, "max": 127, "default": 100},
+        {"name": "Drone Decay", "cc": 25, "min": 0, "max": 127, "default": 90},
+        {"name": "Reverb Mix", "cc": 26, "min": 0, "max": 127, "default": 0}
+      ]
+    }
+  ]
+}

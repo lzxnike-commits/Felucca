@@ -1,0 +1,34 @@
+#include "MyCustomEngine.h"
+
+MyCustomEngine customSynth;
+
+// Hooked directly into the MIDI note-on / note-off pipeline
+void onMidiNoteOn(uint8_t note, uint8_t velocity) {
+    // Standard MIDI to Frequency conversion: 440 * 2^((note-69)/12)
+    float frequency = 440.0f * std::pow(2.0f, (note - 69) / 12.0f);
+    customSynth.setFrequency(frequency);
+    customSynth.triggerNote(true);
+}
+
+void onMidiNoteOff(uint8_t note) {
+    customSynth.triggerNote(false);
+}
+
+// Hooked into CC controls from WebMIDI interface or FM-1 hardware knobs
+void onControlChange(uint8_t controlNumber, uint8_t controlValue) {
+    float normalizedValue = controlValue / 127.0f;
+    customSynth.updateParameter(controlNumber, normalizedValue);
+}
+
+// Primary audio interrupt service routine callback
+void hardwareAudioCallback(int16_t* hardwareBuffer, uint32_t sampleCount) {
+    // Dynamic float scratchpad buffer
+    float floatBuffer[sampleCount * 2]; 
+    
+    customSynth.processAudioBuffer(floatBuffer, sampleCount);
+
+    // Convert floating output (-1.0 to 1.0) back to raw 16-bit PCM for the Jieli DAC
+    for (uint32_t i = 0; i < sampleCount * 2; ++i) {
+        hardwareBuffer[i] = (int16_t)(floatBuffer[i] * 32767.0f);
+    }
+}
