@@ -1,0 +1,20 @@
+#include "PolyCustomEngine.h"
+
+PolyCustomEngine multiVoiceSynth;
+
+void onMidiNoteOn(uint8_t note, uint8_t velocity) {
+    if (velocity == 0) {
+        multiVoiceSynth.noteOff(note);
+    } else {
+        multiVoiceSynth.noteOn(note, velocity);
+    }
+}
+
+void onMidiNoteOff(uint8_t note) {
+    multiVoiceSynth.noteOff(note);
+}
+
+void onControlChange(uint8_t controlNumber, uint8_t controlValue) {
+    float normalizedValue = controlValue / 127.0f;
+    multiVoiceSynth.updateParameter(controlNumber, normalizedValue);
+}

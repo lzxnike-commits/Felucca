@@ -1,0 +1,261 @@
+#pragma once
+#include <cmath>
+#include <cstdint>
+#include <algorithm>
+
+#define SAMPLE_RATE 44100
+#define TWO_PI 6.28318530717958647692f
+#define MAX_VOICES 5 // Dropped by 1 to free up RAM for the massive reverb buffers
+
+struct SynthParameters {
+    float cutoff = 0.4f;
+    float resonance = 0.1f;
+    float modulationAmount = 0.2f;
+    float attack = 0.01f;
+    float release = 0.6f;
+    
+    // Mega Effects Parameters
+    float delayTime = 0.5f;
+    float delayFeedback = 0.7f; // Allowed to go much higher
+    float delayDamp = 0.3f;     // Lowpass filter inside the delay loop
+    float delayWetMix = 0.4f;
+    
+    float reverbSize = 0.8f;    // Vast space scaling
+    float reverbDecay = 0.85f;  // Long tail length
+    float reverbWetMix = 0.5f;
+};
+
+// ==========================================
+// SYNTH VOICE DEFINITION (Optimized)
+// ==========================================
+class SynthVoice {
+public:
+    float phaseCarrier = 0.0f;
+    float phaseModulator = 0.0f;
+    float carrierFreq = 0.0f;
+    float modulatorFreq = 0.0f;
+    float envelopeValue = 0.0f;
+    bool gateActive = false;
+    uint8_t currentNote = 0;
+    uint32_t age = 0;
+
+    void triggerNote(uint8_t note, float freq) {
+        currentNote = note;
+        carrierFreq = freq;
+        modulatorFreq = freq * 2.0f;
+        gateActive = true;
+        envelopeValue = 1.0f;
+        age = 0;
+    }
+
+    void releaseNote() { gateActive = false; }
+    bool isActive() const { return (gateActive || envelopeValue > 0.001f); }
+
+    float processSample(const SynthParameters& params) {
+        if (!isActive()) return 0.0f;
+        age++;
+
+        phaseModulator += modulatorFreq / SAMPLE_RATE;
+        if (phaseModulator >= 1.0f) phaseModulator -= 1.0f;
+        float modSignal = std::sin(phaseModulator * TWO_PI) * params.modulationAmount;
+
+        phaseCarrier += (carrierFreq / SAMPLE_RATE) + (modSignal * 0.01f);
+        if (phaseCarrier >= 1.0f) phaseCarrier -= 1.0f;
+        float rawSample = std::sin(phaseCarrier * TWO_PI);
+
+        if (!gateActive) {
+            envelopeValue -= (1.0f / (params.release * SAMPLE_RATE));
+            if (envelopeValue < 0.0f) envelopeValue = 0.0f;
+        }
+        return rawSample * envelopeValue;
+    }
+};
+
+// ==========================================
+// EXTREME DELAY (With Dampening & Soft Clipping)
+// ==========================================
+class ExtremeDelay {
+private:
+    static const uint32_t DELAY_BUF_SIZE = 32000; // ~0.72 seconds max
+    float bufferL[DELAY_BUF_SIZE] = {0.0f};
+    float bufferR[DELAY_BUF_SIZE] = {0.0f};
+    uint32_t writePtr = 0;
+    float lastOutL = 0.0f;
+    float lastOutR = 0.0f;
+
+public:
+    void process(float& sampleL, float& sampleR, const SynthParameters& params) {
+        uint32_t delaySamples = static_cast<uint32_t>(params.delayTime * (DELAY_BUF_SIZE - 200)) + 100;
+        
+        int32_t readPtr = static_cast<int32_t>(writePtr) - delaySamples;
+        if (readPtr < 0) readPtr += DELAY_BUF_SIZE;
+
+        float wetL = bufferL[readPtr];
+        float wetR = bufferR[readPtr];
+
+        // Soft saturation drive inside the loop for an analog flavor
+        float feedL = sampleL + (wetR * params.delayFeedback);
+        float feedR = sampleR + (wetL * params.delayFeedback);
+        feedL = std::tanhf(feedL * 1.1f); 
+        feedR = std::tanhf(feedR * 1.1f);
+
+        // High frequency damping filter inside feedback path
+        lastOutL += (1.0f - params.delayDamp) * (feedL - lastOutL);
+        lastOutR += (1.0f - params.delayDamp) * (feedR - lastOutR);
+
+        bufferL[writePtr] = lastOutL;
+        bufferR[writePtr] = lastOutR;
+        writePtr = (writePtr + 1) % DELAY_BUF_SIZE;
+
+        sampleL = (sampleL * (1.0f - params.delayWetMix)) + (wetL * params.delayWetMix);
+        sampleR = (sampleR * (1.0f - params.delayWetMix)) + (wetR * params.delayWetMix);
+    }
+};
+
+// ==========================================
+// EXTREME SPACE REVERB (Optimized FDN/Schroeder)
+// ==========================================
+class ExtremeReverb {
+private:
+    // Prime numbers used for comb line filters to minimize echo resonance patterns
+    static const int NUM_COMBS = 4;
+    const int combTimes[NUM_COMBS] = {1117, 1373, 1583, 1907};
+    float combBuffers[NUM_COMBS][2000] = {{0.0f}};
+    int combIndices[NUM_COMBS] = {0};
+
+    // All-pass filters for stereo widening diffusion
+    float apBufferL[721] = {0.0f};
+    float apBufferR[877] = {0.0f};
+    int apIdxL = 0, apIdxR = 0;
+
+public:
+    void process(float& sampleL, float& sampleR, const SynthParameters& params) {
+        float inputSum = (sampleL + sampleR) * 0.5f;
+        float combOutSum = 0.0f;
+
+        // 1. Parallel Comb Filter bank for massive space decay
+        for (int i = 0; i < NUM_COMBS; ++i) {
+            int bufSize = static_cast<int>(combTimes[i] * params.reverbSize);
+            if (bufSize < 10) bufSize = 10;
+
+            float out = combBuffers[i][combIndices[i]];
+            combBuffers[i][combIndices[i]] = inputSum + (out * params.reverbDecay);
+            
+            combIndices[i] = (combIndices[i] + 1) % bufSize;
+            combOutSum += out;
+        }
+        combOutSum *= 0.25f;
+
+        // 2. All-Pass Filter Left Channel Diffusion
+        float apInL = combOutSum + sampleL;
+        float apBufOutL = apBufferL[apIdxL];
+        float apWetL = -0.6f * apInL + apBufOutL;
+        bufferWriteL(apInL + (apBufOutL * 0.6f));
+        
+        // 3. All-Pass Filter Right Channel Diffusion
+        float apInR = combOutSum + sampleR;
+        float apBufOutR = apBufferR[apIdxR];
+        float apWetR = -0.6f * apInR + apBufOutR;
+        bufferWriteR(apInR + (apBufOutR * 0.6f));
+
+        // Final wet blend crossmix output mapping
+        sampleL = (sampleL * (1.0f - params.reverbWetMix)) + (apWetL * params.reverbWetMix);
+        sampleR = (sampleR * (1.0f - params.reverbWetMix)) + (apWetR * params.reverbWetMix);
+    }
+
+private:
+    void bufferWriteL(float val) {
+        apBufferL[apIdxL] = val;
+        apIdxL = (apIdxL + 1) % 721;
+    }
+    void bufferWriteR(float val) {
+        apBufferR[apIdxR] = val;
+        apIdxR = (apIdxR + 1) % 877;
+    }
+};
+
+// ==========================================
+// CORE AUDIO AUDIO ENGINE MODULE
+// ==========================================
+class PolyCustomEngine {
+private:
+    SynthVoice voices[MAX_VOICES];
+    SynthParameters params;
+    ExtremeDelay delayEffect;
+    ExtremeReverb reverbEffect;
+    float lpL = 0.0f, lpR = 0.0f;
+
+public:
+    PolyCustomEngine() {}
+
+    void noteOn(uint8_t note, uint8_t velocity) {
+        float frequency = 440.0f * std::pow(2.0f, (note - 69) / 12.0f);
+        for (int i = 0; i < MAX_VOICES; ++i) {
+            if (voices[i].isActive() && voices[i].currentNote == note) {
+                voices[i].triggerNote(note, frequency);
+                return;
+            }
+        }
+        for (int i = 0; i < MAX_VOICES; ++i) {
+            if (!voices[i].isActive()) {
+                voices[i].triggerNote(note, frequency);
+                return;
+            }
+        }
+        int oldestIdx = 0; uint32_t maxAge = 0;
+        for (int i = 0; i < MAX_VOICES; ++i) {
+            if (voices[i].age > maxAge) { maxAge = voices[i].age; oldestIdx = i; }
+        }
+        voices[oldestIdx].triggerNote(note, frequency);
+    }
+
+    void noteOff(uint8_t note) {
+        for (int i = 0; i < MAX_VOICES; ++i) {
+            if (voices[i].currentNote == note) voices[i].releaseNote();
+        }
+    }
+
+    void updateParameter(uint8_t paramId, float value) {
+        switch(paramId) {
+            case 10: params.cutoff = value; break;
+            case 11: params.resonance = value; break;
+            case 12: params.modulationAmount = value * 2.5f; break;
+            case 13: params.attack = (value * 2.0f) + 0.001f; break;
+            case 14: params.release = (value * 5.0f) + 0.01f; break;
+            
+            // Extreme Delay MIDI CC bindings
+            case 20: params.delayTime = 0.1f + (value * 0.9f); break;
+            case 21: params.delayFeedback = value * 0.98f; break; // Pushed close to infinity infinite feedback loop
+            case 22: params.delayDamp = value * 0.8f; break;
+            case 23: params.delayWetMix = value; break;
+
+            // Extreme Reverb MIDI CC bindings
+            case 24: params.reverbSize = 0.2f + (value * 0.8f); break;
+            case 25: params.reverbDecay = 0.5f + (value * 0.48f); break; // Near-infinite drone lengths
+            case 26: params.reverbWetMix = value; break;
+        }
+    }
+
+    void processAudioBuffer(float* outputBuffer, uint32_t numSamples) {
+        for (uint32_t i = 0; i < numSamples; ++i) {
+            float mixedSample = 0.0f;
+            for (int v = 0; v < MAX_VOICES; ++v) {
+                mixedSample += voices[v].processSample(params);
+            }
+            mixedSample *= (1.0f / static_cast<float>(MAX_VOICES)) * 1.3f;
+
+            lpL += (params.cutoff * 0.15f) * (mixedSample - lpL);
+            lpR += (params.cutoff * 0.15f) * (mixedSample - lpR);
+
+            float outL = lpL;
+            float outR = lpR;
+
+            // FX Pipeline Chain: Synth -> Delay -> Reverb
+            delayEffect.process(outL, outR, params);
+            reverbEffect.process(outL, outR, params);
+
+            outputBuffer[i * 2]     = std::max(-1.0f, std::min(1.0f, outL));
+            outputBuffer[i * 2 + 1] = std::max(-1.0f, std::min(1.0f, outR));
+        }
+    }
+};

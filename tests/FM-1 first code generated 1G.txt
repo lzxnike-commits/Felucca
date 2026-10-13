@@ -1,0 +1,278 @@
+#pragma once
+#include <cmath>
+#include <cstdint>
+#include <algorithm>
+
+#define SAMPLE_RATE 44100
+#define TWO_PI 6.28318530717958647692f
+#define MAX_VOICES 4 
+
+struct SynthParameters {
+    float cutoff = 0.4f;
+    float resonance = 0.1f;
+    float modulationAmount = 0.2f;
+    float attack = 0.01f;
+    float release = 0.6f;
+    
+    // Haze & Grain Parameters
+    float hazeAmount = 0.0f;   // CC 30: 0.0 to 1.0 (Harmonic drive & low-mid shroud)
+    float grainAmount = 0.0f;  // CC 31: 0.0 to 1.0 (Micro dust crackle & noise)
+
+    // Spatial Effects Parameters
+    float delayTime = 0.5f;
+    float delayFeedback = 0.7f; 
+    float delayDamp = 0.3f;     
+    float delayWetMix = 0.4f;
+    
+    float reverbSize = 0.85f;    
+    float reverbDecay = 0.92f;   
+    float reverbWetMix = 0.5f;
+};
+
+// ==========================================
+// SYNTH VOICE DEFINITION 
+// ==========================================
+class SynthVoice {
+public:
+    float phaseCarrier = 0.0f;
+    float phaseModulator = 0.0f;
+    float carrierFreq = 0.0f;
+    float modulatorFreq = 0.0f;
+    float envelopeValue = 0.0f;
+    bool gateActive = false;
+    uint8_t currentNote = 0;
+    uint32_t age = 0;
+
+    void triggerNote(uint8_t note, float freq) {
+        currentNote = note;
+        carrierFreq = freq;
+        modulatorFreq = freq * 2.0f;
+        gateActive = true;
+        envelopeValue = 1.0f;
+        age = 0;
+    }
+
+    void releaseNote() { gateActive = false; }
+    bool isActive() const { return (gateActive || envelopeValue > 0.001f); }
+
+    float processSample(const SynthParameters& params) {
+        if (!isActive()) return 0.0f;
+        age++;
+
+        phaseModulator += modulatorFreq / SAMPLE_RATE;
+        if (phaseModulator >= 1.0f) phaseModulator -= 1.0f;
+        float modSignal = std::sin(phaseModulator * TWO_PI) * params.modulationAmount;
+
+        phaseCarrier += (carrierFreq / SAMPLE_RATE) + (modSignal * 0.01f);
+        if (phaseCarrier >= 1.0f) phaseCarrier -= 1.0f;
+        float rawSample = std::sin(phaseCarrier * TWO_PI);
+
+        if (!gateActive) {
+            envelopeValue -= (1.0f / (params.release * SAMPLE_RATE));
+            if (envelopeValue < 0.0f) envelopeValue = 0.0f;
+        }
+        return rawSample * envelopeValue;
+    }
+};
+
+// ==========================================
+// HAZE & GRAIN ANALOG FILTER
+// ==========================================
+class HazeGrainFilter {
+private:
+    uint32_t noiseSeed = 0x12345678;
+    float lowpassHazeL = 0.0f;
+    float lowpassHazeR = 0.0f;
+
+    // Fast xorshift random number generator for efficient crackle dust
+    float getNextNoiseSample() {
+        noiseSeed ^= (noiseSeed << 13);
+        noiseSeed ^= (noiseSeed >> 17);
+        noiseSeed ^= (noiseSeed << 5);
+        return (static_cast<float>(static_cast<int32_t>(noiseSeed)) / 2147483648.0f);
+    }
+
+public:
+    void process(float& sampleL, float& sampleR, const SynthParameters& params) {
+        // --- 1. GRAIN (Micro-dust Crackle) ---
+        float rawNoise = getNextNoiseSample();
+        
+        // Emulate random static dust spikes instead of flat white noise
+        float dustTrigger = (rawNoise > 0.985f) ? rawNoise : 0.0f; 
+        float grainSignal = dustTrigger * params.grainAmount * 0.08f; 
+
+        sampleL += grainSignal;
+        sampleR += grainSignal;
+
+        // --- 2. HAZE (Asymmetric Non-linear Saturation) ---
+        if (params.hazeAmount > 0.001f) {
+            float drive = 1.0f + (params.hazeAmount * 2.5f);
+            
+            // Asymmetric soft clipping adds second-harmonic tube-like warmth
+            sampleL = std::tanhf(sampleL * drive + 0.05f * params.hazeAmount) - (0.03f * params.hazeAmount);
+            sampleR = std::tanhf(sampleR * drive + 0.05f * params.hazeAmount) - (0.03f * params.hazeAmount);
+
+            // Shroud Lowpass Filter (darkens the haze to bury it nicely in the low-mids)
+            float hazeCutoff = 0.35f - (params.hazeAmount * 0.25f); // Drops down to a darker shroud as mix increases
+            lowpassHazeL += hazeCutoff * (sampleL - lowpassHazeL);
+            lowpassHazeR += hazeCutoff * (sampleR - lowpassHazeR);
+
+            // Blend between raw and shrouded haze output
+            sampleL = (sampleL * 0.4f) + (lowpassHazeL * 0.6f);
+            sampleR = (sampleR * 0.4f) + (lowpassHazeR * 0.6f);
+        }
+    }
+};
+
+// ==========================================
+// EXTREME DELAY 
+// ==========================================
+class ExtremeDelay {
+private:
+    static const uint32_t DELAY_BUF_SIZE = 32000; 
+    float bufferL[DELAY_BUF_SIZE] = {0.0f};
+    float bufferR[DELAY_BUF_SIZE] = {0.0f};
+    uint32_t writePtr = 0;
+    float lastOutL = 0.0f;
+    float lastOutR = 0.0f;
+
+public:
+    void process(float& sampleL, float& sampleR, const SynthParameters& params) {
+        uint32_t delaySamples = static_cast<uint32_t>(params.delayTime * (DELAY_BUF_SIZE - 200)) + 100;
+        int32_t readPtr = static_cast<int32_t>(writePtr) - delaySamples;
+        if (readPtr < 0) readPtr += DELAY_BUF_SIZE;
+
+        float wetL = bufferL[readPtr];
+        float wetR = bufferR[readPtr];
+
+        float feedL = sampleL + (wetR * params.delayFeedback);
+        float feedR = sampleR + (wetL * params.delayFeedback);
+        
+        feedL = std::tanhf(feedL * 1.1f); 
+        feedR = std::tanhf(feedR * 1.1f);
+
+        lastOutL += (1.0f - params.delayDamp) * (feedL - lastOutL);
+        lastOutR += (1.0f - params.delayDamp) * (feedR - lastOutR);
+
+        bufferL[writePtr] = lastOutL;
+        bufferR[writePtr] = lastOutR;
+        writePtr = (writePtr + 1) % DELAY_BUF_SIZE;
+
+        sampleL = (sampleL * (1.0f - params.delayWetMix)) + (wetL * params.delayWetMix);
+        sampleR = (sampleR * (1.0f - params.delayWetMix)) + (wetR * params.delayWetMix);
+    }
+};
+
+// ==========================================
+// DEEP SPACE REVERB 
+// ==========================================
+class ExtremeReverb {
+private:
+    static const int NUM_COMBS = 6;
+    const int combTimes[NUM_COMBS] = {1117, 1373, 1583, 1721, 1907, 2111};
+    float combBuffers[NUM_COMBS] = {{0.0f}}; 
+    int combIndices[NUM_COMBS] = {0};
+
+    float apBufferL1 = {0.0f}, apBufferL2 = {0.0f};
+    float apBufferR1 = {0.0f}, apBufferR2 = {0.0f};
+    int apIdxL1 = 0, apIdxL2 = 0;
+    int apIdxR1 = 0, apIdxR2 = 0;
+
+public:
+    void process(float& sampleL, float& sampleR, const SynthParameters& params) {
+        float inputSum = (sampleL + sampleR) * 0.5f;
+        float combOutSum = 0.0f;
+
+        for (int i = 0; i < NUM_COMBS; ++i) {
+            int bufSize = static_cast<int>(combTimes[i] * params.reverbSize);
+            if (bufSize < 10) bufSize = 10;
+
+            float out = combBuffers[i][combIndices[i]];
+            combBuffers[i][combIndices[i]] = inputSum + (out * params.reverbDecay);
+            
+            combIndices[i] = (combIndices[i] + 1) % bufSize;
+            combOutSum += out;
+        }
+        combOutSum *= (1.0f / static_cast<float>(NUM_COMBS));
+
+        float apInL = combOutSum + sampleL;
+        float apOutL1 = -0.6f * apInL + apBufferL1[apIdxL1];
+        apBufferL1[apIdxL1] = apInL + (apOutL1 * 0.6f);
+        apIdxL1 = (apIdxL1 + 1) % 721;
+
+        float apOutL2 = -0.5f * apOutL1 + apBufferL2[apIdxL2];
+        apBufferL2[apIdxL2] = apOutL1 + (apOutL2 * 0.5f);
+        apIdxL2 = (apIdxL2 + 1) % 443;
+
+        float apInR = combOutSum + sampleR;
+        float apOutR1 = -0.6f * apInR + apBufferR1[apIdxR1];
+        apBufferR1[apIdxR1] = apInR + (apOutR1 * 0.6f);
+        apIdxR1 = (apIdxR1 + 1) % 877;
+
+        float apOutR2 = -0.5f * apOutR1 + apBufferR2[apIdxR2];
+        apBufferR2[apIdxR2] = apOutR1 + (apOutR2 * 0.5f);
+        apIdxR2 = (apIdxR2 + 1) % 523;
+
+        sampleL = (sampleL * (1.0f - params.reverbWetMix)) + (apOutL2 * params.reverbWetMix);
+        sampleR = (sampleR * (1.0f - params.reverbWetMix)) + (apOutR2 * params.reverbWetMix);
+    }
+};
+
+// ==========================================
+// CORE AUDIO AUDIO ENGINE MODULE
+// ==========================================
+class PolyCustomEngine {
+private:
+    SynthVoice voices[MAX_VOICES];
+    SynthParameters params;
+    HazeGrainFilter hazeGrainFilter;
+    ExtremeDelay delayEffect;
+    ExtremeReverb reverbEffect;
+    float lpL = 0.0f, lpR = 0.0f;
+
+public:
+    PolyCustomEngine() {}
+
+    void noteOn(uint8_t note, uint8_t velocity) {
+        float frequency = 440.0f * std::pow(2.0f, (note - 69) / 12.0f);
+        for (int i = 0; i < MAX_VOICES; ++i) {
+            if (voices[i].isActive() && voices[i].currentNote == note) {
+                voices[i].triggerNote(note, frequency);
+                return;
+            }
+        }
+        for (int i = 0; i < MAX_VOICES; ++i) {
+            if (!voices[i].isActive()) {
+                voices[i].triggerNote(note, frequency);
+                return;
+            }
+        }
+        int oldestIdx = 0; uint32_t maxAge = 0;
+        for (int i = 0; i < MAX_VOICES; ++i) {
+            if (voices[i].age > maxAge) { maxAge = voices[i].age; oldestIdx = i; }
+        }
+        voices[oldestIdx].triggerNote(note, frequency);
+    }
+
+    void noteOff(uint8_t note) {
+        for (int i = 0; i < MAX_VOICES; ++i) {
+            if (voices[i].currentNote == note) voices[i].releaseNote();
+        }
+    }
+
+    void updateParameter(uint8_t paramId, float value) {
+        switch(paramId) {
+            case 10: params.cutoff = value; break;
+            case 11: params.resonance = value; break;
+            case 12: params.modulationAmount = value * 2.5f; break;
+            case 13: params.attack = (value * 2.0f) + 0.001f; break;
+            case 14: params.release = (value * 5.0f) + 0.01f; break;
+            
+            // Haze & Grain
+            case 30: params.hazeAmount = value; break;
+            case 31: params.grainAmount = value; break;
+
+            // Extreme Delay
+            case 20: params.delayTime = 0.1f + (value * 0.9f); break;
+            case 21: params.delayFeedback = value * 0.98f; break; 
+            case 22: params.delayDamp = value * 0.8f; break;

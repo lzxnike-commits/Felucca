@@ -1,0 +1,94 @@
+#pragma once
+#include <cmath>
+#include <cstdint>
+
+// Fixed configuration for the FM-1 / Felucca architecture
+#define SAMPLE_RATE 44100
+#define TWO_PI 6.28318530717958647692f
+
+struct SynthParameters {
+    float cutoff = 0.5f;
+    float resonance = 0.1f;
+    float modulationAmount = 0.0f;
+    float attack = 0.01f;
+    float release = 0.4f;
+};
+
+class MyCustomEngine {
+private:
+    // Oscillator states
+    float phaseCarrier = 0.0f;
+    float phaseModulator = 0.0f;
+    float carrierFreq = 440.0f;
+    float modulatorFreq = 440.0f;
+
+    // Simple Envelope State
+    float envelopeValue = 0.0f;
+    bool gateActive = false;
+
+    // Filter states (Simple One-Pole lowpass for efficiency)
+    float lowpassState = 0.0f;
+
+    SynthParameters params;
+
+public:
+    MyCustomEngine() {}
+
+    void setFrequency(float freq) {
+        carrierFreq = freq;
+        modulatorFreq = freq * 2.0f; // 2:1 harmonic ratio for baseline FM crunch
+    }
+
+    void triggerNote(bool noteOn) {
+        gateActive = noteOn;
+        if (noteOn) {
+            envelopeValue = 1.0f; // Quick trigger attack
+        }
+    }
+
+    void updateParameter(uint8_t paramId, float value) {
+        switch(paramId) {
+            case 0: params.cutoff = value; break;
+            case 1: params.resonance = value; break;
+            case 2: params.modulationAmount = value; break;
+            case 3: params.attack = value; break;
+            case 4: params.release = value; break;
+        }
+    }
+
+    // Main DSP block processing loop
+    void processAudioBuffer(float* outputBuffer, uint32_t numSamples) {
+        float carrierPhaseIncrement = carrierFreq / SAMPLE_RATE;
+        float modulatorPhaseIncrement = modulatorFreq / SAMPLE_RATE;
+
+        for (uint32_t i = 0; i < numSamples; ++i) {
+            // 1. Advance Modulator Phase
+            phaseModulator += modulatorPhaseIncrement;
+            if (phaseModulator >= 1.0f) phaseModulator -= 1.0f;
+
+            // 2. Generate Modulator Wave (Sine)
+            float modSignal = std::sin(phaseModulator * TWO_PI) * params.modulationAmount;
+
+            // 3. Advance Carrier Phase with Frequency Modulation
+            phaseCarrier += carrierPhaseIncrement + (modSignal * 0.01f);
+            if (phaseCarrier >= 1.0f) phaseCarrier -= 1.0f;
+
+            // 4. Generate Carrier Wave
+            float rawSample = std::sin(phaseCarrier * TWO_PI);
+
+            // 5. Apply Simple Envelope Decay
+            if (!gateActive) {
+                envelopeValue -= (1.0f / (params.release * SAMPLE_RATE));
+                if (envelopeValue < 0.0f) envelopeValue = 0.0f;
+            }
+            float ampSample = rawSample * envelopeValue;
+
+            // 6. Apply Lowpass Filter
+            lowpassState += (params.cutoff * 0.1f) * (ampSample - lowpassState);
+
+            // 7. Write to Buffer (Interleaved Left/Right Stereo)
+            outputBuffer[i * 2]     = lowpassState; // Left
+            outputBuffer[i * 2 + 1] = lowpassState; // Right
+        }
+    }
+};
